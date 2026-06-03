@@ -1,0 +1,6 @@
+node_modules/
+.env
+.wa-sessions/
+*.log
+npm-debug.log*
+.DS_Store
