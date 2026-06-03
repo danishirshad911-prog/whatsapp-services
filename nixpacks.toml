@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python3", "make", "gcc"]
+
+[phases.install]
+cmds = ["npm install --production"]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "node src/index.js"
