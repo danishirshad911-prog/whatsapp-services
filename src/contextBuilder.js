@@ -40,7 +40,7 @@ export function buildContextPrompt({ contact, messages, memory, tags, notes, con
     });
   }
 
-  lines.push('', '=== TASK ===', 'Write a helpful, concise reply to the customer's latest message. Reply directly — no preamble.');
+  lines.push('', '=== TASK ===', "Write a helpful, concise reply to the customer's latest message. Reply directly - no preamble.");
   return lines.join('\n');
 }
 
