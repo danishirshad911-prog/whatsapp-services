@@ -7,7 +7,7 @@ export function buildContextPrompt({ contact, messages, memory, tags, notes, con
     lines.push('=== KNOWLEDGE BASE (HIGHEST PRIORITY) ===');
     lines.push('Use this information first when answering.', '');
     knowledgeChunks.forEach((chunk, i) => {
-      lines.push(`[Source ${i + 1}: "${chunk.document_title}" — ${Math.round((chunk._score || 0) * 100)}% relevance]`);
+      lines.push(`[Source ${i + 1}: "${chunk.document_title}" - ${Math.round((chunk._score || 0) * 100)}% relevance]`);
       lines.push(chunk.content_chunk, '');
     });
     lines.push('');
@@ -40,15 +40,11 @@ export function buildContextPrompt({ contact, messages, memory, tags, notes, con
     });
   }
 
-  lines.push('', '=== TASK ===', 'Write a helpful, concise reply to the customer's latest message. Reply directly — no preamble.');
+  lines.push('', '=== TASK ===', 'Write a helpful, concise reply to the latest message. Reply directly, no preamble.');
   return lines.join('\n');
 }
 
 export function buildMemorySummarizationPrompt(contact, recentMessages) {
   const msgText = recentMessages.slice(-30).map(m => `${m.direction === 'inbound' ? 'Customer' : 'Agent'}: ${m.body || '[media]'}`).join('\n');
-  return `Analyze this conversation with "${contact?.name || 'Unknown'}" (+${contact?.phone_number}) and respond ONLY with valid JSON:
-{"summary": "2-3 sentence summary", "key_facts": ["fact1","fact2"], "detected_intent": "lead|support|inquiry|complaint|order|other", "sentiment": "positive|neutral|negative", "is_lead": true/false}
-
-Conversation:
-${msgText}`;
+  return `Analyze this conversation with "${contact?.name || 'Unknown'}" (+${contact?.phone_number}) and respond ONLY with valid JSON:\n{"summary": "2-3 sentence summary", "key_facts": ["fact1","fact2"], "detected_intent": "lead|support|inquiry|complaint|order|other", "sentiment": "positive|neutral|negative", "is_lead": true}\n\nConversation:\n${msgText}`;
 }
