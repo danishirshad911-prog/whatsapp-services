@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { initAuthCreds, BufferJSON } from '@whiskeysockets/baileys';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -18,11 +19,11 @@ export class SessionStore {
   get(key) {
     const fp = path.join(this.dir, `${key}.json`);
     if (!fs.existsSync(fp)) return null;
-    try { return JSON.parse(fs.readFileSync(fp, 'utf8')); } catch { return null; }
+    try { return JSON.parse(fs.readFileSync(fp, 'utf8'), BufferJSON.reviver); } catch { return null; }
   }
   set(key, value) {
     const fp = path.join(this.dir, `${key}.json`);
-    try { fs.writeFileSync(fp, JSON.stringify(value, null, 2), 'utf8'); } catch (err) { logger.error(`[SessionStore] Write failed: ${err.message}`); }
+    try { fs.writeFileSync(fp, JSON.stringify(value, BufferJSON.replacer, 2), 'utf8'); } catch (err) { logger.error(`[SessionStore] Write failed: ${err.message}`); }
   }
   delete(key) {
     const fp = path.join(this.dir, `${key}.json`);
@@ -35,14 +36,30 @@ export class SessionStore {
   exists() { return fs.existsSync(path.join(this.dir, 'creds.json')); }
 }
 
+// ─── CRITICAL FIX: Use Baileys official initAuthCreds() for fresh sessions ───
+// The old implementation returned {} which caused:
+// TypeError: Cannot read properties of undefined (reading 'public')
+// at processHandshake → noiseKey.public was undefined
 export function createAuthState(store) {
-  const creds = store.get('creds') || {};
+  // Load saved creds — if none exist, initialize with Baileys defaults
+  const savedCreds = store.get('creds');
+  const creds = savedCreds ? savedCreds : initAuthCreds();
+
+  // If no saved creds, persist the newly initialized ones immediately
+  if (!savedCreds) {
+    store.set('creds', creds);
+    logger.info('[SessionStore] Fresh credentials initialized with initAuthCreds()');
+  }
+
   const state = {
     creds,
     keys: {
       get: (type, ids) => {
         const data = {};
-        for (const id of ids) { const key = store.get(`${type}-${id}`); if (key) data[id] = key; }
+        for (const id of ids) {
+          const key = store.get(`${type}-${id}`);
+          if (key) data[id] = key;
+        }
         return data;
       },
       set: (data) => {
