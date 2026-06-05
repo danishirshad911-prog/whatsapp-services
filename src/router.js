@@ -7,6 +7,7 @@ import { checkOllamaHealth, pullModel } from './ollama.js';
 import { processDocument } from './documentProcessor.js';
 import { deleteDocumentChunks } from './ragEngine.js';
 import { runCampaign, pauseCampaign, resumeCampaign, cancelCampaign, buildAudience, isCampaignRunning } from './campaignEngine.js';
+import { SessionStore } from './sessionStore.js';
 
 const router = Router();
 
@@ -31,6 +32,21 @@ router.post('/send-message', async (req, res) => {
 
 router.post('/disconnect', async (_req, res) => { await disconnect(); res.json({ success: true }); });
 router.post('/reconnect', async (_req, res) => { res.json({ success: true }); forceReconnect().catch(() => {}); });
+
+// Clear session — deletes stored creds so fresh initAuthCreds() runs on next connect
+router.post('/clear-session', async (_req, res) => {
+  try {
+    await disconnect().catch(() => {});
+    const store = new SessionStore('default');
+    store.clear();
+    logger.info('[Router] Session cleared — fresh credentials will be generated on next connect');
+    res.json({ success: true, message: 'Session cleared. Call /reconnect to get a fresh QR.' });
+    // Auto-reconnect after 1s
+    setTimeout(() => forceReconnect().catch(() => {}), 1000);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 router.get('/ai/health', async (_req, res) => { const h = await checkOllamaHealth(); res.status(h.healthy ? 200 : 503).json(h); });
 router.post('/ai/pull-model', async (req, res) => { const { model } = req.body || {}; if (!model) return res.status(400).json({ error: '"model" required' }); res.json({ success: true }); pullModel(model).catch(() => {}); });
