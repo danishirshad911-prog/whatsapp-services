@@ -8,6 +8,8 @@ services:
     startCommand: node src/index.js
     healthCheckPath: /health
     envVars:
+      - key: NODE_VERSION
+        value: 20.11.0
       - key: NODE_ENV
         value: production
       - key: PORT
