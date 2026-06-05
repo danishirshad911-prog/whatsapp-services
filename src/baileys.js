@@ -1,4 +1,5 @@
-import makeWASocket, { DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast, makeCacheableSignalKeyStore, PHONENUMBER_MCC } from '@whiskeysockets/baileys';
+import makeWASocket from '@whiskeysockets/baileys';
+import { DisconnectReason, fetchLatestBaileysVersion, isJidBroadcast, makeCacheableSignalKeyStore } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode';
 import NodeCache from 'node-cache';
