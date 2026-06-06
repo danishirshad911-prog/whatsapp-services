@@ -1,5 +1,10 @@
 /* global process, fetch */
-import { callOllama, checkOllamaHealth } from './ollama.js';
+/**
+ * AI Engine — Cloud-first (Base44 LLM) with Ollama fallback
+ * Primary: Base44 InvokeLLM (works 24/7 on Render — no Ollama needed)
+ * Fallback: Local Ollama if OLLAMA_URL is configured
+ * Languages: Arabic (Gulf), English, Roman Urdu — auto-detect
+ */
 import { buildContextPrompt, buildMemorySummarizationPrompt } from './contextBuilder.js';
 import { retrieveRelevantChunks } from './ragEngine.js';
 import { sendMessage, getConnectionState } from './baileys.js';
@@ -8,10 +13,74 @@ import { publish } from './redis.js';
 import { logger } from './logger.js';
 
 const BASE44_API = process.env.BASE44_API_URL || 'https://api.base44.com/api/apps';
+const BASE44_LLM_API = 'https://api.base44.com/api/integrations/invoke-llm';
 const APP_ID = process.env.BASE44_APP_ID || '';
 const API_KEY = process.env.BASE44_API_KEY || '';
 const processedMessages = new Set();
 const AI_DEDUPE_TTL = 60_000;
+
+// ─── Language Detection ────────────────────────────────────────────────────────
+function detectLanguage(text) {
+  if (!text) return 'en';
+  if (/[؀-ۿ]/.test(text)) return 'ar';
+  const romanUrduWords = ['kya','hai','hain','kar','main','aap','nahi','bata','chahiye','theek','shukriya','price','kitna','kab','kaise','haan','ji','bhai'];
+  const lower = text.toLowerCase();
+  if (romanUrduWords.filter(w => lower.includes(w)).length >= 2) return 'roman_urdu';
+  return 'en';
+}
+
+// ─── Cloud LLM Call (Base44) ───────────────────────────────────────────────────
+async function callBase44LLM({ prompt, systemPrompt, maxTokens = 300 }) {
+  if (!APP_ID || !API_KEY) throw new Error('BASE44_APP_ID or BASE44_API_KEY not set');
+  const fullPrompt = systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt;
+  const res = await fetch(`https://api.base44.com/api/apps/${APP_ID}/integrations/Core/InvokeLLM`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` },
+    body: JSON.stringify({
+      prompt: fullPrompt,
+      response_json_schema: {
+        type: 'object',
+        properties: { reply: { type: 'string' }, intent: { type: 'string' }, sentiment: { type: 'string' } }
+      }
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) { const err = await res.text().catch(() => ''); throw new Error(`Base44 LLM: ${res.status} ${err}`); }
+  const data = await res.json();
+  const reply = data?.reply || data?.response || '';
+  return { response: reply, latency_ms: 0, prompt_tokens: 0, completion_tokens: 0, model: 'base44-llm' };
+}
+
+// ─── Ollama fallback ───────────────────────────────────────────────────────────
+async function callOllamaFallback({ model, prompt, temperature, maxTokens }) {
+  const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
+  const start = Date.now();
+  const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model, prompt, stream: false, options: { temperature, num_predict: maxTokens } }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) throw new Error(`Ollama ${res.status}`);
+  const data = await res.json();
+  return { response: (data.response || '').trim(), latency_ms: Date.now() - start, prompt_tokens: data.prompt_eval_count || 0, completion_tokens: data.eval_count || 0, model };
+}
+
+// ─── Smart AI call (cloud first, Ollama fallback) ─────────────────────────────
+async function callAI({ model, prompt, systemPrompt, temperature, maxTokens }) {
+  const start = Date.now();
+  const isCloudModel = !model || model === 'base44-llm' || model === 'llama3';
+  // Try cloud first
+  try {
+    const result = await callBase44LLM({ prompt, systemPrompt, maxTokens });
+    result.latency_ms = Date.now() - start;
+    return result;
+  } catch (cloudErr) {
+    logger.warn(`[AIEngine] Cloud LLM failed: ${cloudErr.message} — trying Ollama fallback`);
+  }
+  // Ollama fallback
+  const fullPrompt = systemPrompt ? `${systemPrompt}\n\n${prompt}` : prompt;
+  return callOllamaFallback({ model: model || 'llama3', prompt: fullPrompt, temperature, maxTokens });
+}
 
 async function b44(method, entity, query = {}, data = null) {
   if (!APP_ID || !API_KEY) return null;
@@ -65,7 +134,7 @@ async function storeCRMReply({ conversation, contact, reply, model }) {
 async function updateAIMemory({ contact, messages, existingMemory, settings }) {
   if (messages.length < 5) return;
   try {
-    const result = await callOllama({ model: settings?.model || 'llama3', prompt: buildMemorySummarizationPrompt(contact, messages), temperature: 0.3, maxTokens: 400 });
+    const result = await callAI({ model: settings?.model || 'base44-llm', prompt: buildMemorySummarizationPrompt(contact, messages), temperature: 0.3, maxTokens: 400 });
     const jsonMatch = result.response.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
     if (!parsed) return;
@@ -81,28 +150,49 @@ export async function processInboundWithAI(msgEvent) {
   if (msgId && processedMessages.has(msgId)) return;
   if (msgId) { processedMessages.add(msgId); setTimeout(() => processedMessages.delete(msgId), AI_DEDUPE_TTL); }
 
-  logger.info(`[AIEngine] Processing from ${from}: "${body.slice(0, 60)}"`);
+  // Detect language for better responses
+  const detectedLang = detectLanguage(body);
+  logger.info(`[AIEngine] Processing from ${from} [lang:${detectedLang}]: "${body.slice(0, 60)}"`);
+
   let context;
   try { context = await fetchCRMContext(from); } catch (err) { logger.error(`[AIEngine] Context fetch failed: ${err.message}`); return; }
 
   const { contact, conversation, messages, memory, tags, notes, settings } = context;
-  if (!settings?.enabled) return;
+  if (!settings?.enabled) { logger.debug('[AIEngine] AI disabled globally'); return; }
   if (settings.excluded_contacts?.includes(contact?.id)) return;
-  if (!contact) return;
+  if (!contact) { logger.warn(`[AIEngine] No contact for ${from} — skipping`); return; }
 
-  const ollamaHealth = await checkOllamaHealth();
-  if (!ollamaHealth.healthy) { logger.error('[AIEngine] Ollama not reachable'); return; }
-
+  // Get RAG chunks if available
   let knowledgeChunks = [];
-  try { knowledgeChunks = await retrieveRelevantChunks(body, 5); } catch {}
+  try { knowledgeChunks = await retrieveRelevantChunks(body, 3); } catch {}
 
-  const fullPrompt = buildContextPrompt({ contact, messages, memory, tags, notes, conversation, settings, knowledgeChunks });
+  // Build prompt with language context
+  const contextPrompt = buildContextPrompt({ contact, messages, memory, tags, notes, conversation, settings, knowledgeChunks });
 
-  let ollamaResult;
-  try { ollamaResult = await callOllama({ model: settings.model || 'llama3', prompt: fullPrompt, temperature: settings.temperature ?? 0.7, maxTokens: settings.max_tokens || 300 }); }
-  catch (err) { logger.error(`[AIEngine] Ollama failed: ${err.message}`); return; }
+  // System prompt with language instruction
+  const langInstructions = {
+    ar: 'IMPORTANT: The customer is writing in Arabic. You MUST reply in Arabic (العربية). Use Gulf Arabic style.',
+    roman_urdu: 'IMPORTANT: The customer is writing in Roman Urdu. You MUST reply in Roman Urdu (Urdu in English letters).',
+    en: 'Reply in clear English.',
+  };
+  const systemWithLang = `${settings?.system_prompt || 'You are a professional CRM assistant.'}\n\n${langInstructions[detectedLang] || langInstructions.en}`;
 
-  const reply = ollamaResult.response;
+  let aiResult;
+  try {
+    aiResult = await callAI({
+      model: settings.model || 'base44-llm',
+      prompt: contextPrompt,
+      systemPrompt: systemWithLang,
+      temperature: settings.temperature ?? 0.7,
+      maxTokens: settings.max_tokens || 300,
+    });
+  } catch (err) {
+    logger.error(`[AIEngine] All AI backends failed: ${err.message}`);
+    await b44('POST', 'AILog', {}, { contact_id: contact?.id || '', status: 'failed', error: err.message, model: settings?.model || 'base44-llm' }).catch(() => {});
+    return;
+  }
+
+  const reply = aiResult.response;
   if (!reply?.trim()) return;
 
   const delay = settings.auto_reply_delay_ms ?? 1500;
@@ -110,11 +200,11 @@ export async function processInboundWithAI(msgEvent) {
 
   if (getConnectionState() === 'connected') {
     try { await sendMessage(from, reply); } catch (err) { logger.error(`[AIEngine] Send failed: ${err.message}`); return; }
-  } else return;
+  } else { logger.warn('[AIEngine] WhatsApp not connected — reply not sent'); return; }
 
-  await storeCRMReply({ conversation, contact, reply, model: settings?.model || 'llama3' });
-  await b44('POST', 'AILog', {}, { contact_id: contact?.id || '', conversation_id: conversation?.id || '', model: settings?.model || '', latency_ms: ollamaResult?.latency_ms || 0, prompt_tokens: ollamaResult?.prompt_tokens || 0, completion_tokens: ollamaResult?.completion_tokens || 0, response: reply.slice(0, 500), status: 'success', error: '' }).catch(() => {});
+  await storeCRMReply({ conversation, contact, reply, model: aiResult.model || 'base44-llm' });
+  await b44('POST', 'AILog', {}, { contact_id: contact?.id || '', conversation_id: conversation?.id || '', model: aiResult.model || 'base44-llm', latency_ms: aiResult.latency_ms || 0, response: reply.slice(0, 500), status: 'success', error: '' }).catch(() => {});
   updateAIMemory({ contact, messages, existingMemory: memory, settings }).catch(() => {});
-  broadcast('ai_reply_sent', { contact_id: contact.id, conversation_id: conversation?.id, reply, model: settings?.model, latency_ms: ollamaResult.latency_ms });
-  await publish('ai.reply_sent', { contact_id: contact.id, conversation_id: conversation?.id, reply, latency_ms: ollamaResult.latency_ms });
+  broadcast('ai_reply_sent', { contact_id: contact.id, conversation_id: conversation?.id, reply, model: aiResult.model, lang: detectedLang });
+  publish('ai.reply_sent', { contact_id: contact.id, reply, lang: detectedLang }).catch(() => {});
 }
