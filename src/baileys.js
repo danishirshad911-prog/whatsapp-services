@@ -25,6 +25,116 @@ export function getPhoneNumber() { return phoneNumber; }
 export function getDeviceInfo() { return deviceInfo; }
 export function getSocket() { return sock; }
 
+// ─── Direct Base44 CRM save (no Redis needed) ────────────────────────────────
+const BASE44_API_URL = process.env.BASE44_API_URL || 'https://api.base44.com/api/apps';
+const BASE44_APP_ID = process.env.BASE44_APP_ID || '';
+const BASE44_API_KEY = process.env.BASE44_API_KEY || '';
+
+async function b44Post(entity, data) {
+  if (!BASE44_APP_ID || !BASE44_API_KEY) return null;
+  const res = await fetch(`${BASE44_API_URL}/${BASE44_APP_ID}/entities/${entity}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BASE44_API_KEY}` },
+    body: JSON.stringify(data),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`b44 POST ${entity}: ${res.status}`);
+  return res.json();
+}
+
+async function b44Get(entity, filter = {}, limit = 1) {
+  if (!BASE44_APP_ID || !BASE44_API_KEY) return [];
+  const qs = new URLSearchParams({ filter: JSON.stringify(filter), limit: String(limit) });
+  const res = await fetch(`${BASE44_API_URL}/${BASE44_APP_ID}/entities/${entity}?${qs}`, {
+    headers: { 'Authorization': `Bearer ${BASE44_API_KEY}` },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data?.items || data || [];
+}
+
+async function b44Put(entity, id, data) {
+  if (!BASE44_APP_ID || !BASE44_API_KEY) return null;
+  const res = await fetch(`${BASE44_API_URL}/${BASE44_APP_ID}/entities/${entity}/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${BASE44_API_KEY}` },
+    body: JSON.stringify(data),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`b44 PUT ${entity}: ${res.status}`);
+  return res.json();
+}
+
+async function saveToCRM(normalized) {
+  const phone = normalized.from.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+  const ts = normalized.timestamp ? new Date(normalized.timestamp * 1000).toISOString() : new Date().toISOString();
+
+  // 1. Find or create Contact
+  let contacts = await b44Get('Contact', { phone_number: phone }, 1);
+  let contact = contacts[0];
+  if (!contact) {
+    contact = await b44Post('Contact', {
+      phone_number: phone,
+      name: normalized.pushName || phone,
+      push_name: normalized.pushName || '',
+      status: 'active',
+      unread_count: 0,
+      last_message_at: ts,
+      last_message_preview: (normalized.body || '').slice(0, 80),
+    });
+    logger.info(`[CRM] New contact created: ${phone}`);
+  } else {
+    b44Put('Contact', contact.id, {
+      last_message_at: ts,
+      last_message_preview: (normalized.body || '').slice(0, 80),
+      unread_count: (contact.unread_count || 0) + 1,
+      name: (!contact.name || contact.name === phone) && normalized.pushName ? normalized.pushName : contact.name,
+    }).catch(() => {});
+  }
+  if (!contact?.id) return;
+
+  // 2. Find or create open Conversation
+  let convs = await b44Get('Conversation', { contact_id: contact.id, status: 'open' }, 1);
+  let conversation = convs[0];
+  if (!conversation) {
+    conversation = await b44Post('Conversation', {
+      contact_id: contact.id,
+      contact_phone: phone,
+      status: 'open',
+      unread_count: 1,
+      session_id: 'default',
+      last_message_at: ts,
+      last_message_preview: (normalized.body || '').slice(0, 80),
+      last_message_direction: 'inbound',
+    });
+    logger.info(`[CRM] New conversation created for: ${phone}`);
+  } else {
+    b44Put('Conversation', conversation.id, {
+      last_message_at: ts,
+      last_message_preview: (normalized.body || '').slice(0, 80),
+      last_message_direction: 'inbound',
+      unread_count: (conversation.unread_count || 0) + 1,
+      status: 'open',
+    }).catch(() => {});
+  }
+  if (!conversation?.id) return;
+
+  // 3. Save Message
+  await b44Post('Message', {
+    conversation_id: conversation.id,
+    contact_id: contact.id,
+    direction: 'inbound',
+    body: normalized.body || '',
+    message_type: 'text',
+    whatsapp_message_id: normalized.id || `in-${Date.now()}`,
+    status: 'delivered',
+    timestamp_wa: ts,
+  });
+
+  logger.info(`[CRM] Message saved for ${phone}: "${(normalized.body || '').slice(0, 40)}"`);
+}
+
 export async function startSession(sessionId = 'default') {
   clearTimeout(reconnectTimer);
 
@@ -61,7 +171,7 @@ export async function startSession(sessionId = 'default') {
     msgRetryCounterCache: msgRetryCache,
     generateHighQualityLinkPreview: false,
     shouldIgnoreJid: jid => isJidBroadcast(jid),
-    browser: ['WA CRM', 'Chrome', '121.0.0'],
+    browser: ['Chrome', 'Chrome', '121.0.0'],
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
     keepAliveIntervalMs: 10_000,
@@ -131,8 +241,11 @@ export async function startSession(sessionId = 'default') {
       const body = msg.message?.conversation
         || msg.message?.extendedTextMessage?.text
         || msg.message?.imageMessage?.caption
+        || msg.message?.videoMessage?.caption
         || '';
       const from = msg.key.remoteJid || '';
+      // Skip group messages
+      if (from.endsWith('@g.us') || from.endsWith('@broadcast')) continue;
       const normalized = {
         id: msg.key.id,
         from,
@@ -143,8 +256,13 @@ export async function startSession(sessionId = 'default') {
         pushName: msg.pushName || '',
         raw: msg,
       };
+      // Broadcast via WebSocket (frontend CRM picks this up)
       broadcast('new_message', normalized);
-      await publish(CHANNELS.MESSAGE_RECEIVED, normalized).catch(() => {});
+      // Publish to Redis if available (non-blocking)
+      publish(CHANNELS.MESSAGE_RECEIVED, normalized).catch(() => {});
+      // Save directly to Base44 WhatsAppMessage entity (Redis-independent)
+      saveToCRM(normalized).catch(err => logger.error(`[Baileys] CRM save: ${err.message}`));
+      // AI + Lead pipeline (non-blocking)
       processInboundWithAI(normalized).catch(err => logger.error(`[AIEngine] ${err.message}`));
       processLeadPipeline(normalized).catch(err => logger.error(`[LeadEngine] ${err.message}`));
     }
